@@ -34,6 +34,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.plus
 import kotlinx.coroutines.test.TestCoroutineScheduler
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
+import kotlinx.coroutines.withContext
 
 public interface TurbineContext : CoroutineScope {
   public fun <R> Flow<R>.testIn(
@@ -59,7 +60,8 @@ internal class TurbineContextImpl(turbineContext: CoroutineContext) :
 
   private val turbineElements =
     (turbineContext[TurbineRegistryElement] ?: EmptyCoroutineContext) +
-      (turbineContext[TurbineTimeoutElement] ?: EmptyCoroutineContext)
+      (turbineContext[TurbineTimeoutElement] ?: EmptyCoroutineContext) +
+      (turbineContext[TurbineLifecycleElement] ?: EmptyCoroutineContext)
 
   override fun <R> Flow<R>.testIn(
     scope: CoroutineScope,
@@ -82,7 +84,10 @@ public suspend fun turbineScope(
       if (timeout == null) {
         coroutineScope(block)
       } else {
-        withTurbineTimeout(timeout, block)
+        checkTimeout(timeout)
+        // An explicit `turbineScope`/`test` timeout is an Explicit override for every contained
+        // await, taking priority over any enclosing withTurbineTimeout element.
+        withContext(TurbineTimeoutElement(timeout, TimeoutSource.Explicit), block)
       }
     }
     scopeFn {
@@ -96,8 +101,12 @@ public suspend fun turbineScope(
         val reportsWithExceptions =
           turbineRegistry
             .map {
-              it
-                .reportUnconsumedEvents()
+              val report = it.reportUnconsumedEvents()
+              // The catch-all aggregation never surfaces the per-turbine assertion itself; it
+              // either rethrows the original failure or wraps the reported exception. Record the
+              // check without a per-turbine failure.
+              it.notifyUnconsumedChecked(report, null)
+              report
                 // The exception will have cancelled its job hierarchy, producing cancellation
                 // exceptions
                 // in its wake. These aren't meaningful test feedback
@@ -208,16 +217,24 @@ private fun <T> Flow<T>.collectTurbineIn(
   val unconfined =
     scope.coroutineContext[TestCoroutineScheduler]?.let(::UnconfinedTestDispatcher) ?: Unconfined
 
+  val lifecycleListeners = scope.coroutineContext[TurbineLifecycleElement]?.listeners.orEmpty()
   val output = Channel<T>(UNLIMITED)
   val job =
     scope.launch(unconfined, start = UNDISPATCHED) {
+      lifecycleListeners.forEach { it.collectorStarted() }
       try {
-        collect { output.trySend(it) }
-        output.close()
+        collect { value ->
+          output.trySend(value)
+          lifecycleListeners.forEach { it.channelSent(value) }
+        }
+        output.close(null).also { lifecycleListeners.forEach { it.channelClosed(null) } }
       } catch (e: Throwable) {
-        output.close(e)
+        output.close(e).also { lifecycleListeners.forEach { it.channelClosed(e) } }
       }
     }
+  job.invokeOnCompletion { cause -> lifecycleListeners.forEach { it.collectJobCompleted(cause) } }
 
-  return ChannelTurbine(output, job, timeout, name).also { scope.reportTurbine(it) }
+  return ChannelTurbine(output, job, timeout, name, lifecycleListeners).also {
+    scope.reportTurbine(it)
+  }
 }

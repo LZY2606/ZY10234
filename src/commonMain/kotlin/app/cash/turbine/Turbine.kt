@@ -23,6 +23,8 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.Channel.Factory.UNLIMITED
 import kotlinx.coroutines.channels.ChannelResult
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.withContext
 
 internal const val debug = false
 
@@ -93,7 +95,7 @@ public operator fun <T> Turbine<T>.plusAssign(value: T) {
  *   failed.
  */
 public fun <T> Turbine(timeout: Duration? = null, name: String? = null): Turbine<T> =
-  ChannelTurbine(Channel(UNLIMITED), null, timeout, name)
+  ChannelTurbine(Channel(UNLIMITED), null, timeout, name, emptyList())
 
 internal class ChannelTurbine<T>(
   channel: Channel<T>,
@@ -101,20 +103,43 @@ internal class ChannelTurbine<T>(
   private val collectJob: Job?,
   private val timeout: Duration?,
   private val name: String?,
+  private val extraLifecycleListeners: List<TurbineLifecycleListener> = emptyList(),
 ) : Turbine<T> {
-  private suspend fun <T> withTurbineTimeout(block: suspend () -> T): T {
-    return if (timeout != null) {
-      withTurbineTimeout(timeout) { block() }
-    } else {
-      block()
-    }
+  /**
+   * Listeners observed on the most recent `await*`/`cancel` call on this turbine, retained so the
+   * non-suspending [ensureAllEventsConsumed] (which may run from a scope completion handler) can
+   * report the check to context-installed listeners.
+   */
+  private var recentContextLifecycleListeners: List<TurbineLifecycleListener> = emptyList()
+
+  private suspend fun <R> withAwaitLifecycle(block: suspend () -> R): R {
+    val contextListeners = currentCoroutineContext()[TurbineLifecycleElement]?.listeners.orEmpty()
+    recentContextLifecycleListeners = contextListeners
+    val listeners = (extraLifecycleListeners + contextListeners).distinct()
+    // Forward the single await enter/exit pair (with the resolved event) to this turbine's
+    // listeners, and install the explicit per-turbine timeout as the highest-priority element.
+    val added =
+      if (timeout != null) {
+        TurbineTimeoutElement(timeout, TimeoutSource.Explicit) +
+          TurbineLifecycleForwarding(listeners)
+      } else {
+        TurbineLifecycleForwarding(listeners)
+      }
+    return withContext(added) { block() }
   }
 
   private val channel =
     object : Channel<T> by channel {
+      override fun trySend(element: T): ChannelResult<Unit> {
+        val result = channel.trySend(element)
+        if (result.isSuccess) extraLifecycleListeners.forEach { it.channelSent(element) }
+        return result
+      }
+
       override fun tryReceive(): ChannelResult<T> {
         val result = channel.tryReceive()
         val event = result.toEvent()
+        if (event != null) extraLifecycleListeners.forEach { it.channelReceived(event) }
         if (event is Event.Error || event is Event.Complete) ignoreRemainingEvents = true
 
         return result
@@ -122,14 +147,20 @@ internal class ChannelTurbine<T>(
 
       override suspend fun receive(): T =
         try {
-          channel.receive()
-        } catch (e: Throwable) {
-          ignoreRemainingEvents = true
-          throw e
-        }
+            channel.receive()
+          } catch (e: Throwable) {
+            ignoreRemainingEvents = true
+            throw e
+          }
+          .also { value ->
+            extraLifecycleListeners.forEach { it.channelReceived(Event.Item(value)) }
+          }
 
       override suspend fun receiveCatching(): ChannelResult<T> {
         return channel.receiveCatching().also {
+          it.toEvent()?.let { event ->
+            extraLifecycleListeners.forEach { it.channelReceived(event) }
+          }
           if (it.toEvent()?.isTerminal == true) {
             ignoreRemainingEvents = true
           }
@@ -137,11 +168,13 @@ internal class ChannelTurbine<T>(
       }
 
       override fun cancel(cause: CancellationException?) {
+        extraLifecycleListeners.forEach { it.channelCancelRequested(cause) }
         collectJob?.cancel()
         channel.close(cause)
       }
 
       override fun close(cause: Throwable?): Boolean {
+        extraLifecycleListeners.forEach { it.channelClosed(cause) }
         collectJob?.cancel()
         return channel.close(cause)
       }
@@ -158,6 +191,9 @@ internal class ChannelTurbine<T>(
 
   @OptIn(DelicateCoroutinesApi::class)
   override suspend fun cancel() {
+    val contextListeners = currentCoroutineContext()[TurbineLifecycleElement]?.listeners.orEmpty()
+    recentContextLifecycleListeners = contextListeners
+    (extraLifecycleListeners + contextListeners).distinct().forEach { it.cancelRequested() }
     if (!channel.isClosedForSend) ignoreTerminalEvents = true
     channel.cancel()
     collectJob?.cancelAndJoin()
@@ -206,17 +242,19 @@ internal class ChannelTurbine<T>(
 
   override fun expectMostRecentItem(): T = channel.expectMostRecentItem(name = name)
 
-  override suspend fun awaitEvent(): Event<T> = withTurbineTimeout {
+  override suspend fun awaitEvent(): Event<T> = withAwaitLifecycle {
     channel.awaitEvent(name = name)
   }
 
-  override suspend fun awaitItem(): T = withTurbineTimeout { channel.awaitItem(name = name) }
+  override suspend fun awaitItem(): T = withAwaitLifecycle { channel.awaitItem(name = name) }
 
-  override suspend fun skipItems(count: Int) = withTurbineTimeout { channel.skipItems(count, name) }
+  override suspend fun skipItems(count: Int) = withAwaitLifecycle {
+    channel.skipItems(count, name)
+  }
 
-  override suspend fun awaitComplete() = withTurbineTimeout { channel.awaitComplete(name = name) }
+  override suspend fun awaitComplete() = withAwaitLifecycle { channel.awaitComplete(name = name) }
 
-  override suspend fun awaitError(): Throwable = withTurbineTimeout {
+  override suspend fun awaitError(): Throwable = withAwaitLifecycle {
     channel.awaitError(name = name)
   }
 
@@ -243,9 +281,22 @@ internal class ChannelTurbine<T>(
   override fun ensureAllEventsConsumed() {
     val report = reportUnconsumedEvents()
 
-    if (report.unconsumed.isNotEmpty()) {
-      throw TurbineAssertionError(buildString { report.describe(this) }, report.cause)
-    }
+    val failure =
+      if (report.unconsumed.isNotEmpty()) {
+        TurbineAssertionError(buildString { report.describe(this) }, report.cause)
+      } else {
+        null
+      }
+    notifyUnconsumedChecked(report, failure)
+    if (failure != null) throw failure
+  }
+
+  internal fun notifyUnconsumedChecked(
+    report: UnconsumedEventReport<*>,
+    failure: AssertionError?,
+  ) {
+    val listeners = (extraLifecycleListeners + recentContextLifecycleListeners).distinct()
+    listeners.forEach { it.unconsumedChecked(report, failure) }
   }
 }
 

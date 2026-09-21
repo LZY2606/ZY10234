@@ -435,6 +435,15 @@ withTurbineTimeout(10.milliseconds) {
 Most of Turbine's APIs are implemented as extensions on `Channel`.
 The more limited API surface of `Turbine` is usually preferable, but these extensions are also available as public APIs if you need them.
 
+### Lifecycle Reference
+
+`Flow.test`, `Flow.testIn`, standalone `Turbine`s, and the `ReceiveChannel` extensions share the
+same `Event` model but differ in who starts collection, who cancels, which exceptions each side
+observes, and when the unconsumed-event check runs.
+See [`docs/lifecycle.md`](docs/lifecycle.md) for the lifecycle anatomy, including sequence
+diagrams, the four canceled/completed states, the `cancelAndIgnoreRemainingEvents` vs.
+`cancelAndConsumeRemainingEvents` semantics, and timeout precedence.
+
 # License
 
     Copyright 2018 Square, Inc.

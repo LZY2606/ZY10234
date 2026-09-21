@@ -77,25 +77,54 @@ public fun <T> ReceiveChannel<T>.expectNoEvents(name: String? = null) {
  * This function will always return a terminal event on a closed [ReceiveChannel].
  */
 public suspend fun <T> ReceiveChannel<T>.awaitEvent(name: String? = null): Event<T> {
-  val timeout = contextTimeout()
-  return try {
-    withAppropriateTimeout(timeout) { receiveCatching().toEvent()!! }
-  } catch (e: TimeoutCancellationException) {
-    throw TurbineAssertionError("No ${"value produced".qualifiedBy(name)} in $timeout", e)
-  } catch (e: TurbineTimeoutCancellationException) {
-    throw TurbineAssertionError("No ${"value produced".qualifiedBy(name)} in $timeout", e)
+  val resolved = resolveTimeout()
+  val timeout = resolved.timeout
+  val mechanism =
+    if (coroutineContext[TestCoroutineScheduler] != null) {
+      TimeoutMechanism.WallClock
+    } else {
+      TimeoutMechanism.VirtualTime
+    }
+  // A forwarding element (installed by ChannelTurbine) owns the single enter/exit pair; otherwise
+  // the raw channel extension notifies whatever context listeners are present.
+  val listeners =
+    coroutineContext[TurbineLifecycleForwardingKey]?.listeners
+      ?: coroutineContext[TurbineLifecycleElement]?.listeners.orEmpty()
+  listeners.forEach {
+    it.timeoutResolved(resolved.source, timeout, mechanism)
+    it.awaitEntered(resolved.source, timeout, mechanism)
   }
+  var event: Event<T>? = null
+  return try {
+      withAppropriateTimeout(timeout, mechanism) { receiveCatching().toEvent()!! }
+    } catch (e: TimeoutCancellationException) {
+      val failure = TurbineAssertionError("No ${"value produced".qualifiedBy(name)} in $timeout", e)
+      listeners.forEach { it.awaitExited(event, failure) }
+      throw failure
+    } catch (e: TurbineTimeoutCancellationException) {
+      val failure = TurbineAssertionError("No ${"value produced".qualifiedBy(name)} in $timeout", e)
+      listeners.forEach { it.awaitExited(event, failure) }
+      throw failure
+    } catch (e: Throwable) {
+      listeners.forEach { it.awaitExited(event, e) }
+      throw e
+    }
+    .also { received ->
+      event = received
+      listeners.forEach { it.awaitExited(received, null) }
+    }
 }
 
 private suspend fun <T> withAppropriateTimeout(
   timeout: Duration,
+  mechanism: TimeoutMechanism,
   block: suspend CoroutineScope.() -> T,
 ): T {
-  return if (coroutineContext[TestCoroutineScheduler] != null) {
-    // withTimeout uses virtual time, which will hang.
-    withWallclockTimeout(timeout, block)
-  } else {
-    withTimeout(timeout, block)
+  return when (mechanism) {
+    // withTimeout uses virtual time, which will hang inside a TestScheduler, so use a wall-clock
+    // timer on a separate scope instead.
+    TimeoutMechanism.WallClock -> withWallclockTimeout(timeout, block)
+    TimeoutMechanism.VirtualTime -> withTimeout(timeout, block)
   }
 }
 

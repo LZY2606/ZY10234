@@ -99,12 +99,29 @@ internal suspend fun <T> reportTurbines(
 internal fun CoroutineScope.reportTurbine(turbine: ChannelTurbine<*>) =
   coroutineContext[TurbineRegistryElement]?.registry?.add(turbine)
 
-internal class TurbineTimeoutElement(val timeout: Duration) : CoroutineContext.Element {
+internal class TurbineTimeoutElement(
+  val timeout: Duration,
+  val source: TimeoutSource = TimeoutSource.Context,
+) : CoroutineContext.Element {
   companion object Key : CoroutineContext.Key<TurbineTimeoutElement>
 
   override val key: CoroutineContext.Key<*> = Key
 }
 
-internal suspend fun contextTimeout(): Duration {
-  return currentCoroutineContext()[TurbineTimeoutElement.Key]?.timeout ?: DEFAULT_TIMEOUT
+internal class ResolvedTimeout(val timeout: Duration, val source: TimeoutSource)
+
+/**
+ * Resolve the timeout applying to an `await*` call.
+ *
+ * A context-installed [TurbineTimeoutElement] carries its provenance: `test`/`turbineScope` and
+ * per-turbine overrides install it as [TimeoutSource.Explicit], while `withTurbineTimeout` installs
+ * [TimeoutSource.Context]. Absent any element the library default applies.
+ */
+internal suspend fun resolveTimeout(): ResolvedTimeout {
+  val element = currentCoroutineContext()[TurbineTimeoutElement.Key]
+  return if (element != null) {
+    ResolvedTimeout(element.timeout, element.source)
+  } else {
+    ResolvedTimeout(DEFAULT_TIMEOUT, TimeoutSource.Default)
+  }
 }

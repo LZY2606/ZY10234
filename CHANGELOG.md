@@ -4,7 +4,10 @@
 [Unreleased]: https://github.com/cashapp/turbine/compare/1.2.0...HEAD
 
 ### Added
-- Nothing yet!
+- Internal lifecycle instrumentation hooks and a deterministic lifecycle test suite documenting
+  collection ownership, cancellation, unconsumed-event checks, and timeout precedence across
+  `test`, `testIn`, standalone `Turbine`, and the channel extensions. See `docs/lifecycle.md`.
+  No public API changes.
 
 ### Changed
 - Nothing yet!
