@@ -59,7 +59,8 @@ internal class TurbineContextImpl(turbineContext: CoroutineContext) :
 
   private val turbineElements =
     (turbineContext[TurbineRegistryElement] ?: EmptyCoroutineContext) +
-      (turbineContext[TurbineTimeoutElement] ?: EmptyCoroutineContext)
+      (turbineContext[TurbineTimeoutElement] ?: EmptyCoroutineContext) +
+      (turbineContext[LifecycleSinkElement.Key] ?: EmptyCoroutineContext)
 
   override fun <R> Flow<R>.testIn(
     scope: CoroutineScope,
@@ -82,14 +83,16 @@ public suspend fun turbineScope(
       if (timeout == null) {
         coroutineScope(block)
       } else {
-        withTurbineTimeout(timeout, block)
+        withTurbineTimeout(timeout, TimeoutSource.Explicit, block)
       }
     }
     scopeFn {
+      val failureSink = currentCoroutineContext().lifecycleSink
       try {
         val testContext = TurbineContextImpl(currentCoroutineContext())
         testContext.validate()
       } catch (e: Throwable) {
+        failureSink?.record(LifecycleEvent.ScopeFailure(e.eventName() ?: "Throwable"))
         // The exception needs to be reraised. However, if there are any unconsumed events
         // from other turbines (including this one), those may indicate an underlying problem.
         // So: create a report with all the registered turbines, and include exception as cause
@@ -97,7 +100,7 @@ public suspend fun turbineScope(
           turbineRegistry
             .map {
               it
-                .reportUnconsumedEvents()
+                .reportUnconsumedEvents(origin = "turbineScope", sink = failureSink)
                 // The exception will have cancelled its job hierarchy, producing cancellation
                 // exceptions
                 // in its wake. These aren't meaningful test feedback
@@ -141,10 +144,10 @@ public suspend fun <T> Flow<T>.test(
   validate: suspend TurbineTestContext<T>.() -> Unit,
 ) {
   turbineScope(timeout) {
-    collectTurbineIn(this, null, name).apply {
+    collectTurbineIn(this, null, name, owner = "test").apply {
       TurbineTestContextImpl(this, currentCoroutineContext()).validate()
       cancel()
-      ensureAllEventsConsumed()
+      ensureAllEventsConsumed(origin = "ensureAllEventsConsumed")
     }
   }
 }
@@ -183,15 +186,17 @@ public fun <T> Flow<T>.testIn(
     )
   }
 
-  val turbine = collectTurbineIn(scope, timeout, name)
+  val turbine = collectTurbineIn(scope, timeout, name, owner = "testIn")
 
   scope.coroutineContext[Job]?.invokeOnCompletion { exception ->
     if (debug) println("Scope ending ${exception ?: ""}")
 
+    scope.coroutineContext.lifecycleSink?.record(LifecycleEvent.ScopeExiting(exception.eventName()))
+
     // Only validate events were consumed if the scope is exiting normally.
     // CancellationException also indicates _normal_ cancellation of a coroutine.
     if (exception == null || exception is CancellationException) {
-      turbine.ensureAllEventsConsumed()
+      turbine.ensureAllEventsConsumed(origin = "scopeCompletion")
     }
   }
 
@@ -202,22 +207,40 @@ private fun <T> Flow<T>.collectTurbineIn(
   scope: CoroutineScope,
   timeout: Duration?,
   name: String?,
-): ReceiveTurbine<T> {
+  owner: String,
+): ChannelTurbine<T> {
   // Use test-specific unconfined if test scheduler is in use to inherit its virtual time.
   @OptIn(ExperimentalCoroutinesApi::class) // UnconfinedTestDispatcher is still experimental.
   val unconfined =
     scope.coroutineContext[TestCoroutineScheduler]?.let(::UnconfinedTestDispatcher) ?: Unconfined
 
+  val sink = scope.coroutineContext.lifecycleSink
+  sink?.record(LifecycleEvent.CollectorStarted(owner))
+
   val output = Channel<T>(UNLIMITED)
   val job =
     scope.launch(unconfined, start = UNDISPATCHED) {
       try {
-        collect { output.trySend(it) }
+        collect { item ->
+          output.trySend(item)
+          sink?.record(LifecycleEvent.ChannelSent(Event.Item(item).toString()))
+        }
         output.close()
+        sink?.record(LifecycleEvent.ChannelClosed(Event.Complete.toString()))
       } catch (e: Throwable) {
         output.close(e)
+        sink?.record(LifecycleEvent.ChannelClosed(Event.Error(e).toString()))
       }
     }
 
-  return ChannelTurbine(output, job, timeout, name).also { scope.reportTurbine(it) }
+  job.invokeOnCompletion { throwable ->
+    sink?.record(
+      LifecycleEvent.JobCompleted(
+        cancelled = job.isCancelled,
+        cause = throwable.eventName(),
+      )
+    )
+  }
+
+  return ChannelTurbine(output, job, timeout, name, sink).also { scope.reportTurbine(it) }
 }

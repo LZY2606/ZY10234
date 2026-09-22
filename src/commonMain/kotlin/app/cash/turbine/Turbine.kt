@@ -95,16 +95,23 @@ public operator fun <T> Turbine<T>.plusAssign(value: T) {
 public fun <T> Turbine(timeout: Duration? = null, name: String? = null): Turbine<T> =
   ChannelTurbine(Channel(UNLIMITED), null, timeout, name)
 
+internal fun <T> recordingTurbine(
+  sink: LifecycleSink,
+  timeout: Duration? = null,
+  name: String? = null,
+): Turbine<T> = ChannelTurbine(Channel(UNLIMITED), null, timeout, name, sink)
+
 internal class ChannelTurbine<T>(
   channel: Channel<T>,
   /** Non-null if [channel] is being populated by an external `Flow` collection. */
   private val collectJob: Job?,
   private val timeout: Duration?,
   private val name: String?,
+  private val lifecycleSink: LifecycleSink? = null,
 ) : Turbine<T> {
   private suspend fun <T> withTurbineTimeout(block: suspend () -> T): T {
     return if (timeout != null) {
-      withTurbineTimeout(timeout) { block() }
+      withTurbineTimeout(timeout, TimeoutSource.Explicit) { block() }
     } else {
       block()
     }
@@ -154,10 +161,15 @@ internal class ChannelTurbine<T>(
       throw IllegalStateException(
         "Attempt to add item to a closed Turbine${name?.let { " named $it" } ?: ""}."
       )
+    lifecycleSink?.record(LifecycleEvent.ItemAdded(Event.Item(item).toString()))
   }
 
-  @OptIn(DelicateCoroutinesApi::class)
-  override suspend fun cancel() {
+  @OptIn(DelicateCoroutinesApi::class) override suspend fun cancel() = cancel(source = "cancel")
+
+  internal suspend fun cancel(source: String) {
+    lifecycleSink?.record(
+      LifecycleEvent.CancelRequested(source = source, openForSend = !channel.isClosedForSend)
+    )
     if (!channel.isClosedForSend) ignoreTerminalEvents = true
     channel.cancel()
     collectJob?.cancelAndJoin()
@@ -165,6 +177,7 @@ internal class ChannelTurbine<T>(
 
   @OptIn(DelicateCoroutinesApi::class)
   override fun close(cause: Throwable?) {
+    lifecycleSink?.record(LifecycleEvent.CloseRequested(cause.eventName()))
     if (!channel.isClosedForSend) ignoreTerminalEvents = true
     channel.close(cause)
     collectJob?.cancel()
@@ -182,7 +195,7 @@ internal class ChannelTurbine<T>(
   private var ignoreRemainingEvents = false
 
   override suspend fun cancelAndIgnoreRemainingEvents() {
-    cancel()
+    cancel(source = "cancelAndIgnoreRemainingEvents")
     ignoreRemainingEvents = true
   }
 
@@ -194,8 +207,9 @@ internal class ChannelTurbine<T>(
         if (event is Event.Error || event is Event.Complete) break
       }
     }
+    lifecycleSink?.record(LifecycleEvent.EventsDrained(events.map { it.toString() }))
     ignoreRemainingEvents = true
-    cancel()
+    cancel(source = "cancelAndConsumeRemainingEvents")
 
     return events
   }
@@ -220,8 +234,20 @@ internal class ChannelTurbine<T>(
     channel.awaitError(name = name)
   }
 
-  internal fun reportUnconsumedEvents(): UnconsumedEventReport<T> {
-    if (ignoreRemainingEvents) return UnconsumedEventReport(emptyList())
+  internal fun reportUnconsumedEvents(
+    origin: String = "ensureAllEventsConsumed",
+    sink: LifecycleSink? = lifecycleSink,
+  ): UnconsumedEventReport<T> {
+    if (ignoreRemainingEvents) {
+      sink?.record(
+        LifecycleEvent.UnconsumedChecked(
+          origin = origin,
+          events = emptyList(),
+          nonEmpty = false,
+        )
+      )
+      return UnconsumedEventReport(emptyList())
+    }
 
     val unconsumed = mutableListOf<Event<T>>()
     var cause: Throwable? = null
@@ -237,11 +263,23 @@ internal class ChannelTurbine<T>(
       }
     }
 
+    sink?.record(
+      LifecycleEvent.UnconsumedChecked(
+        origin = origin,
+        events = unconsumed.map { it.toString() },
+        nonEmpty = unconsumed.isNotEmpty(),
+      )
+    )
+
     return UnconsumedEventReport(name = name, unconsumed = unconsumed, cause = cause)
   }
 
   override fun ensureAllEventsConsumed() {
-    val report = reportUnconsumedEvents()
+    ensureAllEventsConsumed(origin = "ensureAllEventsConsumed")
+  }
+
+  internal fun ensureAllEventsConsumed(origin: String) {
+    val report = reportUnconsumedEvents(origin = origin)
 
     if (report.unconsumed.isNotEmpty()) {
       throw TurbineAssertionError(buildString { report.describe(this) }, report.cause)

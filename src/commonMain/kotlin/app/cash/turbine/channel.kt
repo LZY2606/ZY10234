@@ -15,7 +15,6 @@
  */
 package app.cash.turbine
 
-import kotlin.coroutines.coroutineContext
 import kotlin.time.Duration
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -29,10 +28,10 @@ import kotlinx.coroutines.channels.ChannelResult
 import kotlinx.coroutines.channels.ClosedReceiveChannelException
 import kotlinx.coroutines.channels.ReceiveChannel
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
-import kotlinx.coroutines.test.TestCoroutineScheduler
 import kotlinx.coroutines.withTimeout
 
 /**
@@ -77,21 +76,39 @@ public fun <T> ReceiveChannel<T>.expectNoEvents(name: String? = null) {
  * This function will always return a terminal event on a closed [ReceiveChannel].
  */
 public suspend fun <T> ReceiveChannel<T>.awaitEvent(name: String? = null): Event<T> {
-  val timeout = contextTimeout()
+  val context = currentCoroutineContext()
+  val sink = context.lifecycleSink
+  val (timeout, timeoutSource) = resolveTimeout(explicit = null, context = context)
+  val mechanism = TimeoutMechanism.forContext(context)
+  sink?.record(
+    LifecycleEvent.TimeoutResolved(
+      timeout = timeout.toString(),
+      source = timeoutSource.name,
+      mechanism = mechanism.name,
+    )
+  )
+  sink?.record(LifecycleEvent.AwaitEntered)
   return try {
-    withAppropriateTimeout(timeout) { receiveCatching().toEvent()!! }
+    withAppropriateTimeout(timeout, mechanism) { receiveCatching().toEvent()!! }
+      .also { sink?.record(LifecycleEvent.AwaitExited(it.toString())) }
   } catch (e: TimeoutCancellationException) {
+    sink?.record(LifecycleEvent.AwaitExited("Timeout"))
     throw TurbineAssertionError("No ${"value produced".qualifiedBy(name)} in $timeout", e)
   } catch (e: TurbineTimeoutCancellationException) {
+    sink?.record(LifecycleEvent.AwaitExited("Timeout"))
     throw TurbineAssertionError("No ${"value produced".qualifiedBy(name)} in $timeout", e)
+  } catch (e: CancellationException) {
+    sink?.record(LifecycleEvent.AwaitExited("Cancelled"))
+    throw e
   }
 }
 
 private suspend fun <T> withAppropriateTimeout(
   timeout: Duration,
+  mechanism: TimeoutMechanism,
   block: suspend CoroutineScope.() -> T,
 ): T {
-  return if (coroutineContext[TestCoroutineScheduler] != null) {
+  return if (mechanism == TimeoutMechanism.WallClock) {
     // withTimeout uses virtual time, which will hang.
     withWallclockTimeout(timeout, block)
   } else {

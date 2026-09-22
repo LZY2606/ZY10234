@@ -395,6 +395,129 @@ The shared flow types Kotlin currently provides are:
 * `MutableSharedFlow`
 * `SharedFlow`
 
+### Lifecycle Anatomy
+
+`test`, `testIn`, standalone `Turbine()`, and the `ReceiveChannel` extensions all share one event
+model — the sealed `Event` type (`Item`, `Complete`, `Error`) — but they differ in who starts
+collection, who cancels it, who observes exceptions, and when `ensureAllEventsConsumed` runs.
+
+The internal lifecycle recorder observes these transitions without changing behavior; the
+deterministic tests that pin each timeline live in
+`LifecycleTest` (common) and `LifecycleJvmTest` (JVM-only assertions).
+
+**Entry points and ownership**
+
+| Entry point | Collection starts | Cancelled by | Unconsumed check | Exceptions observed by |
+| --- | --- | --- | --- | --- |
+| `Flow.test { }` | Before the block runs, on a `UNDISPATCHED` child job | `test` when the block returns (`cancel()` + `join`) | `test` after cancel | Validation block directly; upstream failures become `Event.Error`, or an assertion with the failure as `cause` if unconsumed |
+| `Flow.testIn(scope)` | Before the call returns, on a job launched in `scope` | Caller (`cancel`) or the owning scope ending | An `invokeOnCompletion` handler when the scope finishes | Caller through `awaitError()`; otherwise a scope-completion assertion (`CompletionHandlerException` wrapping the `AssertionError`) |
+| `Turbine()` | Never — there is no collector | Caller only | Caller (`ensureAllEventsConsumed`) | Caller (`awaitError()` / `expectMostRecentItem()`) |
+| `ReceiveChannel` extensions (`await*`, `take*`) | Never | None — the raw channel is used as-is | Never | Caller directly (an `Error` event throws from the await) |
+
+**`Flow.test` normal completion**
+
+```mermaid
+sequenceDiagram
+    participant T as test()
+    participant C as collect job (UNDISPATCHED)
+    participant Q as UNLIMITED channel
+    participant B as validation block
+    T->>C: launch + run to first suspension
+    C->>Q: trySend(item) / close()
+    B->>Q: awaitItem() / awaitComplete()
+    B-->>T: block returns
+    T->>C: cancel() + cancelAndJoin()
+    T->>T: ensureAllEventsConsumed()
+```
+
+Pinned by `testStartsCollectorUndispatchedThenCancelsAndVerifiesOnNormalCompletion`. The collector
+job finishes immediately after `close()`, so for a fast upstream the job is already completed
+before the block's first await; the unconditional end-of-block `cancel()` is then a no-op join.
+
+**Validation block throws**
+
+```mermaid
+sequenceDiagram
+    participant B as validation block
+    participant T as turbineScope
+    participant R as registered turbines
+    participant C as collect job
+    B-->>T: throw e
+    T->>R: reportUnconsumedEvents (cancellations stripped)
+    T->>C: cancelled by scope teardown
+    T-->>B: rethrow e (or TurbineAssertionError if another turbine holds an error, e as cause)
+```
+
+Pinned by `testBlockThrowingIsRethrownDirectlyAndCancelsCollector` (the throwable is rethrown as-is)
+and `validationBlockFailureWithUpstreamErrorWrapsButKeepsBothVisible`.
+
+**`testIn` scope exit**
+
+```mermaid
+sequenceDiagram
+    participant U as user code
+    participant S as owning CoroutineScope
+    participant C as collect job
+    participant H as invokeOnCompletion
+    U->>S: flow.testIn(scope)
+    S->>C: launch (UNDISPATCHED)
+    U->>U: await*() or cancel()
+    S-->>H: completing (null or CancellationException)
+    H->>H: ensureAllEventsConsumed
+```
+
+Pinned by `testInForegroundScopeCollectsUntilAwaitCompleteAndChecksOnScopeExit`,
+`testInForegroundScopeUnconsumedItemFailsWhenScopeIsCancelled`, and
+`testInBackgroundScopeIsStillAliveWhenTurbineScopeExits` for `runTest`'s `backgroundScope`, which is
+cancelled only during `runTest` teardown.
+
+**Four distinct terminal states**
+
+1. *Terminal event enqueued but not consumed* — `Complete`/`Error` sits in the unlimited buffer;
+   `ChannelClosed` is recorded but the collector job has typically completed already. Pinned by
+   `stateOneTerminalEventEnqueuedButNotConsumed`.
+2. *Collection job completed* — observable as `JobCompleted(cancelled=false)`; a later `cancel()`
+   joins a finished job. Pinned by `stateTwoCollectorJobCompletedIsObservableAndLaterCancelIsANoOpJoin`.
+3. *ReceiveTurbine cancelled while upstream is alive* — `cancel()` marks terminal events ignored
+   *before* the channel closes, so a terminal event produced by the cancelled collector is not
+   reported. Pinned by `stateThreeCancelledTurbineDoesNotReportTerminalEvents`.
+4. *Owning scope finished* — the `testIn` completion handler runs the check exactly once at scope
+   exit. Pinned by `stateFourScopeFinishedChecksTestInTurbines`.
+
+**Buffered terminal events and the two consuming cancels**
+
+* `cancelAndIgnoreRemainingEvents()` never drains the buffer: it sets the ignore flag, cancels and
+  joins, and the unconsumed report short-circuits. A buffered `Error` is swallowed (not thrown),
+  and a buffered `Complete` is not reported. Pinned by
+  `ignoreCancelOnBufferedCompleteDoesNotDrainAndNeverThrows`,
+  `ignoreCancelOnBufferedErrorSwallowsTheError`.
+* `cancelAndConsumeRemainingEvents()` first non-blockingly drains every buffered event up to and
+  including the terminal event, returns them as `List<Event<T>>`, then cancels. The returned
+  `Event.Error` carries the upstream throwable; the subsequent report is empty. Pinned by
+  `consumeCancelOnBufferedCompleteDrainsAndReturnsComplete` and
+  `consumeCancelOnBufferedItemsAndErrorDrainsIncludingError`.
+
+Calling plain `cancel()` after the channel was *already closed* does not retroactively suppress the
+buffered terminal event (`stateOneTerminalEventEnqueuedButNotConsumed`); suppression only happens
+when cancel wins the race (`stateThreeCancelledTurbineDoesNotReportTerminalEvents`).
+
+**Exception causes**
+
+* An unconsumed upstream `Error` produces an `AssertionError` whose `cause` is the upstream
+  throwable (`unconsumedUpstreamErrorAssertionCarriesErrorAsCauseNotSuppressed`).
+* A `testIn` scope-exit assertion surfaces as a `CompletionHandlerException` wrapping the
+  `AssertionError`; it does not replace the scope's cancellation
+  (`scopeCancellationSuppressesUnconsumedEventAssertion`).
+
+**Implementation map**
+
+* Collector job and send/close lifecycle: `collectTurbineIn` in `flow.kt`.
+* `test`/`testIn` ownership and the scope-exit handler: `flow.kt`.
+* Cancellation, draining, and the unconsumed report: `ChannelTurbine` in `Turbine.kt`.
+* Await timeout selection and the wall-clock/virtual split: `awaitEvent`,
+  `withAppropriateTimeout`, `withWallclockTimeout` in `channel.kt`; timeout elements and
+  `resolveTimeout` in `coroutines.kt`.
+
 ### Timeouts
 
 Turbine applies a timeout whenever it waits for an event.
@@ -429,6 +552,27 @@ withTurbineTimeout(10.milliseconds) {
   ...
 }
 ```
+
+Timeout resolution for each `await*` call follows this precedence, strongest first:
+
+1. An explicit `timeout` parameter on the `Turbine` instance (`Turbine(timeout=…)`,
+   `testIn(timeout=…)`) or installed by `test(timeout=…)` for its whole block.
+2. The nearest `withTurbineTimeout` element in the coroutine context.
+3. The built-in default of three seconds.
+
+Pinned by `timeoutDefaultsToThreeSecondsAndWallClockUnderRunTest`,
+`timeoutFromContextElement`, `explicitTurbineParameterBeatsContextAndDefault`,
+`explicitTestParameterBeatsNestedContext`, and `explicitTestInParameterBeatsContext`.
+
+The timing mechanism is chosen from the calling context, not from the timeout source: when a
+`TestCoroutineScheduler` is present, a virtual-time `withTimeout` would never elapse, so Turbine
+races the await against a real-time `delay` on `Dispatchers.Default` and cancels the await when it
+wins; without a scheduler a normal virtual-time `withTimeout` is used. The wall-clock path wraps
+its timeout failure in a `TurbineAssertionError` whose cause is the internal
+`TurbineTimeoutCancellationException`
+(`wallClockTimeoutAssertionWrapsTurbineTimeoutCancellationAsCause`).
+Draining events is linear in the number of buffered events (`cancelAndConsumeRemainingEvents` and
+the unconsumed report both read until the terminal event, at most once per buffered event).
 
 ### Channel Extensions
 
